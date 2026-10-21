@@ -18,9 +18,9 @@ import { getStellarConfig } from "../config/stellarConfig";
 import { ArenaStatsService } from "./arenaStatsService";
 import { enforcePayloadLimits } from "../validation/payloadLimits";
 import { ArenaProjectionCheckpointStore } from "./projection/arenaProjectionCheckpointStore";
+import { OutboxStore } from "./outbox/outboxStore";
 import { initialArenaProjection, type ArenaProjectionState } from "./projection/arenaProjectionFold";
 import { replayArenaProjection, type ArenaReplayOptions } from "./projection/arenaProjectionReplay";
-import { cache, invalidateArena, tags } from "../cache/cacheService";
 import { env } from "../config/env";
 import { RematchService } from "./rematchService";
 
@@ -135,6 +135,7 @@ export interface ArenaProjectionResponse {
 
 export class ArenaService {
   private readonly projectionCheckpoints: ArenaProjectionCheckpointStore;
+  private readonly outbox: OutboxStore;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -142,6 +143,7 @@ export class ArenaService {
     private readonly stellarRpcGateway = new StellarRpcGateway(),
   ) {
     this.projectionCheckpoints = new ArenaProjectionCheckpointStore(prisma);
+    this.outbox = new OutboxStore(prisma);
   }
 
   /**
@@ -247,18 +249,30 @@ export class ArenaService {
       }),
     ) as Prisma.InputJsonValue, "arena_metadata");
 
+    // Creating the arena and emitting its outbox event must be atomic, so a
+    // crash between them cannot leave a persisted arena with no event (#1701).
+    // The rematch linkage rides along in the same transaction.
     let arena;
-    let created = true;
+    let createdArena = true;
     try {
-      arena = await this.prisma.arena.create({
-        data: {
-          id: arenaId,
-          rematchOf,
-          metadata,
-        },
+      arena = await this.prisma.$transaction(async (tx) => {
+        const created = await tx.arena.create({
+          data: {
+            id: arenaId,
+            rematchOf,
+            metadata,
+          },
+        });
+        await this.outbox.append(tx, {
+          eventType: "arena.created",
+          aggregateId: created.id,
+          dedupeKey: `arena.created:${created.id}`,
+          payload: { arenaId: created.id },
+        });
+        return created;
       });
     } catch (error) {
-      // Lost a race with a concurrent retry of the same deployment.
+      // Lost a race with a concurrent retry of the same deployment (#1572).
       const isUniqueViolation =
         error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
       if (!isUniqueViolation) throw error;
@@ -269,16 +283,13 @@ export class ArenaService {
         );
       }
       arena = raced;
-      created = false;
+      createdArena = false;
     }
 
-    await invalidateArena(arena.id).catch(() => {});
-    await cache.invalidate(tags.arenas()).catch(() => {});
-
     // Notify the source arena's prior participants once, only on real
-    // creation (#1572). Best-effort: a notification failure must never undo
-    // the persisted linkage.
-    if (created && rematchOf !== null) {
+    // creation (#1572). Best-effort, after the write commits: a notification
+    // failure must never undo the persisted linkage.
+    if (createdArena && rematchOf !== null) {
       try {
         await new RematchService(this.prisma).notifyPriorParticipants(rematchOf, arena.id);
       } catch {

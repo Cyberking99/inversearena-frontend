@@ -222,6 +222,16 @@ export class PushService {
     this.validateSubscriptionPayload(payload);
     const userAgent =
       payload.userAgent !== undefined ? payload.userAgent.slice(0, 512) : undefined;
+    // Never silently transfer an existing browser endpoint to another wallet.
+    // An endpoint is bearer-like delivery authority; the previous owner must
+    // explicitly revoke it before a different wallet can subscribe it.
+    const existing = await this.prisma.pushSubscription.findUnique({
+      where: { endpoint: payload.endpoint },
+      select: { userId: true },
+    });
+    if (existing && existing.userId !== userId) {
+      throw new Error("PUSH_ENDPOINT_OWNED_BY_ANOTHER_WALLET");
+    }
     const record = await this.prisma.pushSubscription.upsert({
       where: { endpoint: payload.endpoint },
       create: {

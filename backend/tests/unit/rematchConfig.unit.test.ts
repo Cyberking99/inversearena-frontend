@@ -383,9 +383,10 @@ function deploymentService(
   > = {},
 ) {
   const created: Array<{ id: string; rematchOf?: string | null }> = [];
-  const prisma = {
+  // Upstream wraps the create + outbox append in a $transaction (#1701); the
+  // rematch linkage rides along inside it, so the stub must provide one.
+  const transactionClient = {
     arena: {
-      findUnique: async (args: { where: { id: string } }) => existing[args.where.id] ?? null,
       create: async (args: { data: { id: string; rematchOf?: string | null } }) => {
         created.push(args.data);
         return {
@@ -397,6 +398,14 @@ function deploymentService(
         };
       },
     },
+    outboxEvent: { create: async () => {} },
+  };
+  const prisma = {
+    arena: {
+      findUnique: async (args: { where: { id: string } }) => existing[args.where.id] ?? null,
+    },
+    $transaction: async <T>(callback: (tx: typeof transactionClient) => Promise<T>) =>
+      callback(transactionClient),
   };
 
   return {
