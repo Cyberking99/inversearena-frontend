@@ -22,6 +22,7 @@ import { initialArenaProjection, type ArenaProjectionState } from "./projection/
 import { replayArenaProjection, type ArenaReplayOptions } from "./projection/arenaProjectionReplay";
 import { cache, invalidateArena, tags } from "../cache/cacheService";
 import { env } from "../config/env";
+import { RematchService } from "./rematchService";
 
 const CONTRACT_ID_REGEX = /^C[A-Z2-7]{55}$/;
 const TX_HASH_REGEX = /^[0-9a-f]{64}$/i;
@@ -192,6 +193,41 @@ export class ArenaService {
       throw new Error("Deployed arena address is not a valid Soroban contract ID");
     }
 
+    // Rematch linkage (#1572): a rematch must point at an arena we know about,
+    // so the result page and participant notifications have a source.
+    const rematchOf = input.rematchOf ?? null;
+    if (rematchOf !== null) {
+      if (!CONTRACT_ID_REGEX.test(rematchOf)) {
+        throw new Error("rematchOf is not a valid Soroban contract ID");
+      }
+      const source = await this.prisma.arena.findUnique({
+        where: { id: rematchOf },
+        select: { id: true },
+      });
+      if (!source) {
+        throw new Error(`Rematch source arena ${rematchOf} not found`);
+      }
+    }
+
+    // Idempotency (#1572): a caller retrying a confirmed deployment (e.g. after
+    // a dropped response) must not hit a duplicate-key error. The same arena
+    // with the same linkage returns the existing row; a different linkage is a
+    // genuine conflict and must not be silently rewritten.
+    const existing = await this.prisma.arena.findUnique({ where: { id: arenaId } });
+    if (existing) {
+      if ((existing.rematchOf ?? null) !== rematchOf) {
+        throw new Error(
+          `Arena ${arenaId} already exists with a different rematch linkage`,
+        );
+      }
+      return {
+        id: existing.id,
+        metadata: (existing.metadata as Record<string, unknown> | null) ?? null,
+        createdAt: existing.createdAt.toISOString(),
+        updatedAt: existing.updatedAt.toISOString(),
+      };
+    }
+
     // #1455: bound the persisted JSON before the write, never after.
     const metadata: Prisma.InputJsonValue = enforcePayloadLimits(JSON.parse(
       JSON.stringify({
@@ -202,6 +238,7 @@ export class ArenaService {
         stakeToken: input.stakeToken,
         createdBy,
         contractAddress: arenaId,
+        ...(rematchOf !== null ? { rematchOf } : {}),
         deployment: {
           status: "confirmed",
           txHash,
@@ -210,15 +247,44 @@ export class ArenaService {
       }),
     ) as Prisma.InputJsonValue, "arena_metadata");
 
-    const arena = await this.prisma.arena.create({
-      data: {
-        id: arenaId,
-        metadata,
-      },
-    });
+    let arena;
+    let created = true;
+    try {
+      arena = await this.prisma.arena.create({
+        data: {
+          id: arenaId,
+          rematchOf,
+          metadata,
+        },
+      });
+    } catch (error) {
+      // Lost a race with a concurrent retry of the same deployment.
+      const isUniqueViolation =
+        error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
+      if (!isUniqueViolation) throw error;
+      const raced = await this.prisma.arena.findUnique({ where: { id: arenaId } });
+      if (!raced || (raced.rematchOf ?? null) !== rematchOf) {
+        throw new Error(
+          `Arena ${arenaId} already exists with a different rematch linkage`,
+        );
+      }
+      arena = raced;
+      created = false;
+    }
 
     await invalidateArena(arena.id).catch(() => {});
     await cache.invalidate(tags.arenas()).catch(() => {});
+
+    // Notify the source arena's prior participants once, only on real
+    // creation (#1572). Best-effort: a notification failure must never undo
+    // the persisted linkage.
+    if (created && rematchOf !== null) {
+      try {
+        await new RematchService(this.prisma).notifyPriorParticipants(rematchOf, arena.id);
+      } catch {
+        // Intentionally swallowed — the linkage is the durable outcome.
+      }
+    }
 
     return {
       id: arena.id,
